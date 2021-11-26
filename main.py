@@ -24,7 +24,7 @@ parser.add_argument('-n',
                     type=str,
                     default="bb",
                     choices=["bb", "sem_att"],
-                    help='choose a model: enet or penet'
+                    help='choose a model: three_branch_backbone or A-CSPN++'
                     )
 parser.add_argument('-c',
                     '--criterion',
@@ -192,6 +192,7 @@ depth_criterion = criteria.MaskedMSELoss() if (
 #multi batch
 multi_batch_size = 1
 
+
 def iterate(mode, args, loader, model, optimizer, logger, epoch):
     actual_epoch = epoch - args.start_epoch + args.start_epoch_bias
 
@@ -203,9 +204,11 @@ def iterate(mode, args, loader, model, optimizer, logger, epoch):
     # switch to appropriate mode
     assert mode in ["train", "val", "eval", "test_prediction", "test_completion"], \
         "unsupported mode: {}".format(mode)
-
-    model.eval()
-    lr = 0
+    if mode == 'train':
+        model.train()
+    else:
+        model.eval()
+        lr = 0
 
     torch.cuda.empty_cache()
     for i, batch_data in enumerate(loader):
@@ -228,13 +231,15 @@ def iterate(mode, args, loader, model, optimizer, logger, epoch):
             st1_pred, st2_pred, st3_pred, pred = model(batch_data)
         else:
             start = time.time()
-            rgb_conf, semantic_conf, d_conf, rgb_depth, semantic_depth, d_depth,coarse_depth,pred = model(batch_data)
+            pred = model(batch_data)
+            
 
 
         if(args.evaluate):
             gpu_time = time.time() - start
+        #'''
 
-        depth_loss = 0
+        depth_loss, photometric_loss, smooth_loss, mask = 0, 0, 0, None
 
         # inter loss_param
         st1_loss, st2_loss, st3_loss, loss = 0, 0, 0, 0
@@ -248,10 +253,9 @@ def iterate(mode, args, loader, model, optimizer, logger, epoch):
             w_st1, w_st2, w_st3 = 0, 0,0
 
         if mode == 'train':
-
             depth_loss = depth_criterion(pred, gt)
 
-            if args.network_model == 'e':
+            if args.network_model == 'bb':
                 st1_loss = depth_criterion(st1_pred, gt)
                 st2_loss = depth_criterion(st2_pred, gt)
                 st3_loss = depth_criterion(st3_pred, gt)
@@ -263,26 +267,24 @@ def iterate(mode, args, loader, model, optimizer, logger, epoch):
                 optimizer.zero_grad()
             loss.backward()
 
-
-            optimizer.step()
+            if i % multi_batch_size == (multi_batch_size-1) or i==(len(loader)-1):
+                optimizer.step()
             print("loss:", loss, " epoch:", epoch, " ", i, "/", len(loader))
-
-
 
         if mode == "test_completion":
             str_i = str(i)
             path_i = str_i.zfill(10) + '.png'
-            path = os.path.join(args.test_save, path_i)
+            path = os.path.join(args.data_folder_save, path_i)
             vis_utils.save_depth_as_uint16png_upload(pred, path)
 
         if(not args.evaluate):
             gpu_time = time.time() - start
-
+        # measure accuracy and record loss
         with torch.no_grad():
             mini_batch_size = next(iter(batch_data.values())).size(0)
             result = Result()
             if mode != 'test_prediction' and mode != 'test_completion':
-                result.evaluate(pred.data, gt.data)
+                result.evaluate(pred.data, gt.data, photometric_loss)
                 [
                     m.update(result, gpu_time, data_time, mini_batch_size)
                     for m in meters
@@ -313,6 +315,7 @@ def main():
             print("=> loading checkpoint '{}' ... ".format(args.evaluate),
                   end='')
             checkpoint = torch.load(args.evaluate, map_location=device)
+            #args = checkpoint['args']
             args.start_epoch = checkpoint['epoch'] + 1
             args.data_folder = args_new.data_folder
             args.val = args_new.val
@@ -322,31 +325,54 @@ def main():
         else:
             is_eval = True
             print("No model found at '{}'".format(args.evaluate))
-            print("PLEASE  PROVIDE CORRECT PATH.")
             return
 
+    elif args.resume:  # optionally resume from a checkpoint
+        args_new = args
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}' ... ".format(args.resume),
+                  end='')
+            checkpoint = torch.load(args.resume, map_location=device)
+
+            args.start_epoch = checkpoint['epoch'] + 1
+            args.data_folder = args_new.data_folder
+            args.val = args_new.val
+            print("Completed. Resuming from epoch {}.".format(
+                checkpoint['epoch']))
+        else:
+            print("No checkpoint found at '{}'".format(args.resume))
+            return
 
     print("=> creating model and optimizer ... ", end='')
     model = None
     if (args.network_model == 'bb'):
         model = three_branch_bb(args).to(device)
     else:
+
         model = A_CSPN_plus_plus(args).to(device)
 
 
+
+    model_named_params = None
+    model_bone_params = None
+    model_new_params = None
+    optimizer = None
+
     if checkpoint is not None:
-      
+        #print(checkpoint.keys())
         if (args.freeze_backbone == True):
             model.backbone.load_state_dict(checkpoint['model'])
         else:
             model.load_state_dict(checkpoint['model'], strict=False)
+
         print("=> checkpoint state loaded.")
 
     logger = helper.logger(args)
     if checkpoint is not None:
         logger.best_result = checkpoint['best_result']
+        del checkpoint
     print("=> logger created.")
-    print("=> creating data loaders ... ")
+
     test_dataset = None
     test_loader = None
     if (args.test):
@@ -404,7 +430,7 @@ def main():
     model = torch.nn.DataParallel(model)
 
     # Data loading code
-
+    print("=> creating data loaders ... ")
     if not is_eval:
         train_dataset = KittiDepth('train', args)
         train_loader = torch.utils.data.DataLoader(train_dataset,
@@ -417,13 +443,13 @@ def main():
 
     print("=> starting main loop ...")
 
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience= args.patience, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=args.patience, verbose=True)
 
     for epoch in range(args.start_epoch, args.epochs):
         print("=> starting training epoch {} ..".format(epoch))
         iterate("train", args, train_loader, model, optimizer, logger, epoch)  # train for one epoch
 
-
+        # validation memory reset
         for p in model.parameters():
             p.requires_grad = False
         result, is_best = iterate("val", args, val_loader, model, None, logger, epoch)  # evaluate on validation set
@@ -436,6 +462,7 @@ def main():
             for p in model.module.backbone.parameters():
                 p.requires_grad = False
 
+
         helper.save_checkpoint({ # save checkpoint
             'epoch': epoch,
             'model': model.module.state_dict(),
@@ -443,6 +470,7 @@ def main():
             'optimizer' : optimizer.state_dict(),
             'args' : args,
         }, is_best, epoch, logger.output_directory)
+    
 
 if __name__ == '__main__':
     main()

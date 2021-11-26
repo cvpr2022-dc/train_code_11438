@@ -401,4 +401,5 @@ class A_CSPN_plus_plus(nn.Module):
 
         refined_depth = kernel_conf3*depth3 + kernel_conf5*depth5 + kernel_conf7*depth7
        
-        return rgb_conf, semantic_conf, d_conf, rgb_depth, semantic_depth, d_depth,coarse_depth,refined_depth
+        #return rgb_conf, semantic_conf, d_conf, rgb_depth, semantic_depth, d_depth,coarse_depth,refined_depth
+        return refined_depth
